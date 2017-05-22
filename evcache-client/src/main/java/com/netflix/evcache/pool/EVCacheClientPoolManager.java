@@ -8,11 +8,16 @@ import java.util.List;
 import java.util.Map;
 import java.util.StringTokenizer;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
+import java.util.concurrent.locks.ReentrantReadWriteLock.WriteLock;
 
+import javax.annotation.PreDestroy;
 import javax.inject.Inject;
 import javax.inject.Provider;
 import javax.inject.Singleton;
@@ -27,10 +32,14 @@ import com.netflix.config.DynamicIntProperty;
 import com.netflix.config.DynamicStringProperty;
 import com.netflix.discovery.DiscoveryClient;
 import com.netflix.discovery.DiscoveryManager;
+import com.netflix.evcache.EVCacheImpl;
+import com.netflix.evcache.EVCacheInMemoryCache;
 import com.netflix.evcache.connection.DefaultFactoryProvider;
 import com.netflix.evcache.connection.IConnectionFactoryProvider;
 import com.netflix.evcache.event.EVCacheEventListener;
 import com.netflix.evcache.util.EVCacheConfig;
+
+import net.spy.memcached.transcoders.Transcoder;
 
 /**
  * A manager that holds Pools for each EVCache app. When this class is
@@ -62,7 +71,7 @@ import com.netflix.evcache.util.EVCacheConfig;
  */
 @SuppressWarnings("deprecation")
 @edu.umd.cs.findbugs.annotations.SuppressFBWarnings({ "PRMC_POSSIBLY_REDUNDANT_METHOD_CALLS", "DM_CONVERT_CASE",
-        "ST_WRITE_TO_STATIC_FROM_INSTANCE_METHOD" })
+"ST_WRITE_TO_STATIC_FROM_INSTANCE_METHOD" })
 @Singleton
 public class EVCacheClientPoolManager {
     private static final Logger log = LoggerFactory.getLogger(EVCacheClientPoolManager.class);
@@ -76,6 +85,7 @@ public class EVCacheClientPoolManager {
     private final Map<String, EVCacheClientPool> poolMap = new ConcurrentHashMap<String, EVCacheClientPool>();
     private final Map<EVCacheClientPool, ScheduledFuture<?>> scheduledTaskMap = new HashMap<EVCacheClientPool, ScheduledFuture<?>>();
     private final ScheduledThreadPoolExecutor _scheduler;
+    private final ThreadPoolExecutor refreshAsnycPool; 
     private final DiscoveryClient discoveryClient;
     private final ApplicationInfoManager applicationInfoManager;
     private final List<EVCacheEventListener> evcacheEventListenerList;
@@ -84,21 +94,16 @@ public class EVCacheClientPoolManager {
     @Inject
     public EVCacheClientPoolManager(ApplicationInfoManager applicationInfoManager, DiscoveryClient discoveryClient, Provider<IConnectionFactoryProvider> connectionFactoryprovider) {
         instance = this;
-        
-        try {
-            ConfigurationManager.loadCascadedPropertiesFromResources("evcache");
-        } catch (IOException e) {
-            log.info("Default evcache configuration not loaded", e);
-        }
-
         this.applicationInfoManager = applicationInfoManager;
         this.discoveryClient = discoveryClient;
         this.connectionFactoryprovider = connectionFactoryprovider;
         this.evcacheEventListenerList = new ArrayList<EVCacheEventListener>();
-        final int poolSize = ConfigurationManager.getConfigInstance().getInt("default.refresher.poolsize", 1);
+        final int poolSize = EVCacheConfig.getInstance().getDynamicIntProperty("default.refresher.poolsize", 1).get();
 
-        final ThreadFactory factory = new ThreadFactoryBuilder().setDaemon(true).setNameFormat(
-                "EVCacheClientPoolManager_refresher-%d").build();
+        final ThreadFactory asyncFactory = new ThreadFactoryBuilder().setDaemon(true).setNameFormat( "EVCacheClientPool-AsyncPoolRefresher-%d").build();
+        this.refreshAsnycPool = new ThreadPoolExecutor(1,1,30, TimeUnit.SECONDS, new LinkedBlockingQueue<Runnable>(10), asyncFactory, new ThreadPoolExecutor.DiscardPolicy());        
+
+        final ThreadFactory factory = new ThreadFactoryBuilder().setDaemon(true).setNameFormat("EVCacheClientPoolManager-refresher-%d").build();
         _scheduler = new ScheduledThreadPoolExecutor(poolSize, factory);
         defaultRefreshInterval.addCallback(new Runnable() {
             public void run() {
@@ -144,9 +149,10 @@ public class EVCacheClientPoolManager {
     public static EVCacheClientPoolManager getInstance() {
         if (instance == null) {
             new EVCacheClientPoolManager(null, null, new DefaultFactoryProvider());
-            log.warn(
-                    "Please make sure EVCacheClientPoolManager is injected first. This is not the appropriate way to init EVCacheClientPoolManager",
-                    new Exception());
+            if (!EVCacheConfig.getInstance().getDynamicBooleanProperty("evcache.use.simple.node.list.provider", false).get()) {
+                log.warn("Please make sure EVCacheClientPoolManager is injected first. This is not the appropriate way to init EVCacheClientPoolManager."
+                        + " If you are using simple node list provider please set evcache.use.simple.node.list.provider property to true.", new Exception());
+            }
         }
         return instance;
     }
@@ -161,11 +167,14 @@ public class EVCacheClientPoolManager {
         return client;
     }
 
+    /**
+     * TODO Move to @PostConstruct, so that a non-static EVCacheConfig can be injected by DI, so that Configuration
+     *      subsystem can be properly setup via the DI system.
+     */
     public void initAtStartup() {
-        final String appsToInit = ConfigurationManager.getConfigInstance().getString("evcache.appsToInit");
-        if (appsToInit != null) {
-            if (log.isWarnEnabled()) log.warn(
-                    "Use of evcache.appsToInit is deprecated. Please remove this property as their is no effect setting this property.");
+        //final String appsToInit = ConfigurationManager.getConfigInstance().getString("evcache.appsToInit");
+        final String appsToInit = EVCacheConfig.getInstance().getDynamicStringProperty("evcache.appsToInit", "").get();
+        if (appsToInit != null && appsToInit.length() > 0) {
             final StringTokenizer apps = new StringTokenizer(appsToInit, ",");
             while (apps.hasMoreTokens()) {
                 final String app = getAppName(apps.nextToken());
@@ -188,13 +197,13 @@ public class EVCacheClientPoolManager {
         final String APP = getAppName(app);
         if (poolMap.containsKey(APP)) return;
         final EVCacheNodeList provider;
-        if (ConfigurationManager.getConfigInstance().getBoolean(APP + ".use.simple.node.list.provider", false)) {
+        if (EVCacheConfig.getInstance().getChainedBooleanProperty(APP + ".use.simple.node.list.provider", "evcache.use.simple.node.list.provider", false).get()) {
             provider = new SimpleNodeListProvider(APP + "-NODES");
         } else {
             provider = new DiscoveryNodeListProvider(applicationInfoManager, discoveryClient, APP);
         }
 
-        final EVCacheClientPool pool = new EVCacheClientPool(APP, provider, this);
+        final EVCacheClientPool pool = new EVCacheClientPool(APP, provider, refreshAsnycPool, this);
         scheduleRefresh(pool);
         poolMap.put(APP, pool);
     }
@@ -210,7 +219,7 @@ public class EVCacheClientPoolManager {
      * created then will return the existing instance. If not one will be
      * created and returned.
      * 
-     * @param app
+     * @param _app
      *            - name of the evcache app
      * @return the Pool for the give app.
      * @throws IOException
@@ -227,6 +236,7 @@ public class EVCacheClientPoolManager {
         return new HashMap<String, EVCacheClientPool>(poolMap);
     }
 
+    @PreDestroy
     public void shutdown() {
         _scheduler.shutdown();
         for (EVCacheClientPool pool : poolMap.values()) {
@@ -244,12 +254,36 @@ public class EVCacheClientPoolManager {
         return defaultReadTimeout;
     }
 
+    public DynamicIntProperty getDefaultRefreshInterval() {
+        return defaultRefreshInterval;
+    }
+
     private String getAppName(String _app) {
         _app = _app.toUpperCase();
-        final String app = ConfigurationManager.getConfigInstance().getString("EVCacheClientPoolManager." + _app
-                + ".alias", _app).toUpperCase();
+        final String app = EVCacheConfig.getInstance().getDynamicStringProperty("EVCacheClientPoolManager." + _app + ".alias", _app).get().toUpperCase();
         if (log.isDebugEnabled()) log.debug("Original App Name : " + _app + "; Alias App Name : " + app);
         return app;
+    }
+
+    private WriteLock writeLock = new ReentrantReadWriteLock().writeLock();
+    private final Map<String, EVCacheInMemoryCache<?>> inMemoryMap = new ConcurrentHashMap<String, EVCacheInMemoryCache<?>>();
+    @SuppressWarnings("unchecked")
+    public <T> EVCacheInMemoryCache<T> createInMemoryCache(String appName, Transcoder<T> tc, EVCacheImpl impl) {
+        EVCacheInMemoryCache<T> cache = (EVCacheInMemoryCache<T>) inMemoryMap.get(appName);
+        if(cache == null) {
+            writeLock.lock();
+            if((cache = getInMemoryCache(appName)) == null) {
+                cache = new EVCacheInMemoryCache<T>(appName, tc, impl);
+                inMemoryMap.put(appName, cache);
+            }
+            writeLock.unlock();
+        }
+        return cache;
+    }
+
+    @SuppressWarnings("unchecked")
+    public <T> EVCacheInMemoryCache<T> getInMemoryCache(String appName) {
+        return (EVCacheInMemoryCache<T>) inMemoryMap.get(appName);
     }
 
 }

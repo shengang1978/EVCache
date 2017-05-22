@@ -33,6 +33,8 @@ import com.netflix.evcache.pool.observer.EVCacheConnectionObserver;
 import com.netflix.evcache.util.EVCacheConfig;
 import com.netflix.servo.monitor.Counter;
 import com.netflix.servo.monitor.Stopwatch;
+import com.netflix.servo.tag.BasicTagList;
+import com.netflix.servo.tag.TagList;
 
 import net.spy.memcached.CASValue;
 import net.spy.memcached.CachedData;
@@ -79,13 +81,14 @@ public class EVCacheClient {
     private final DynamicIntProperty operationTimeout;
     private final DynamicIntProperty maxReadQueueSize;
     private final ChainedDynamicProperty.BooleanProperty enableChunking;
-    private final ChainedDynamicProperty.IntProperty chunkSize;
+    private final ChainedDynamicProperty.IntProperty chunkSize, writeBlock;
     private final ChunkTranscoder chunkingTranscoder;
     private final SerializingTranscoder decodingTranscoder;
     private static final int SPECIAL_BYTEARRAY = (8 << 8);
     private final EVCacheClientPool pool;
     private Counter addCounter = null;
-    
+    private final ChainedDynamicProperty.BooleanProperty ignoreTouch;
+    protected final TagList tags;
 
     EVCacheClient(String appName, String zone, int id, EVCacheServerGroupConfig config,
             List<InetSocketAddress> memcachedNodesInZone, int maxQueueSize, DynamicIntProperty maxReadQueueSize,
@@ -106,12 +109,15 @@ public class EVCacheClient {
         this.connectionFactory = pool.getEVCacheClientPoolManager().getConnectionFactoryProvider().getConnectionFactory(appName, id, serverGroup, pool.getEVCacheClientPoolManager());
         this.enableChunking = EVCacheConfig.getInstance().getChainedBooleanProperty(this.serverGroup.getName()+ ".chunk.data", appName + ".chunk.data", Boolean.FALSE);
         this.chunkSize = EVCacheConfig.getInstance().getChainedIntProperty(this.serverGroup.getName() + ".chunk.size", appName + ".chunk.size", 1180);
+        this.writeBlock = EVCacheConfig.getInstance().getChainedIntProperty(appName + "." + this.serverGroup.getName() + ".write.block.duration", appName + ".write.block.duration", 25);
         this.chunkingTranscoder = new ChunkTranscoder();
         this.maxWriteQueueSize = maxQueueSize;
+        this.ignoreTouch = EVCacheConfig.getInstance().getChainedBooleanProperty(appName + "." + this.serverGroup.getName() + ".ignore.touch", appName + ".ignore.touch", false);
 
-        this.evcacheMemcachedClient = new EVCacheMemcachedClient(connectionFactory, memcachedNodesInZone, readTimeout, appName, zone, id, serverGroup);
+        this.evcacheMemcachedClient = new EVCacheMemcachedClient(connectionFactory, memcachedNodesInZone, readTimeout, appName, zone, id, serverGroup, this);
         this.connectionObserver = new EVCacheConnectionObserver(appName, serverGroup, id);
         this.evcacheMemcachedClient.addObserver(connectionObserver);
+        this.tags = BasicTagList.of("ServerGroup", serverGroup.getName(), "APP", appName, "Id", String.valueOf(id));
 
         this.decodingTranscoder = new SerializingTranscoder(Integer.MAX_VALUE);
         decodingTranscoder.setCompressionThreshold(Integer.MAX_VALUE);
@@ -124,7 +130,9 @@ public class EVCacheClient {
             final MemcachedNode node = evcacheMemcachedClient.getNodeLocator().getPrimary(key);
             if (node instanceof EVCacheNodeImpl) {
                 final EVCacheNodeImpl evcNode = (EVCacheNodeImpl) node;
-                if (!evcNode.isAvailable()) continue;
+                if (!evcNode.isAvailable()) {
+                    continue;
+                }
 
                 final int size = evcNode.getReadQueueSize();
                 final boolean canAddToOpQueue = size < (maxReadQueueSize.get() * 2);
@@ -151,7 +159,7 @@ public class EVCacheClient {
                 pool.refreshAsync(evcNode);
             }
 
-            long startTime = operationTimeout.get();
+            int i = 0;
             while (true) {
                 final int size = evcNode.getWriteQueueSize();
                 final boolean canAddToOpQueue = size < maxWriteQueueSize;
@@ -160,16 +168,16 @@ public class EVCacheClient {
                 if (canAddToOpQueue) break;
                 EVCacheMetricsFactory.getCounter("EVCacheClient-" + appName + "-WRITE_BLOCK", evcNode.getBaseTags()).increment();
                 try {
-                    Thread.sleep(100);
+                    Thread.sleep(writeBlock.get());
                 } catch (InterruptedException e) {
                     throw new EVCacheException("Thread was Interrupted", e);
                 }
-                if(startTime > 0) {
-                    startTime -= 100;
-                } else {
+
+                if(i++ > 3) {
                     EVCacheMetricsFactory.getCounter("EVCacheClient-" + appName + "-INACTIVE_NODE", evcNode.getBaseTags()).increment();
                     if (log.isDebugEnabled()) log.debug("Node : " + evcNode + " for app : " + appName + "; zone : "
                             + zone + " is not active. Will Fail Fast and the write will be dropped for key : " + key);
+                    evcNode.shutdown();
                     return false;
                 }
             }
@@ -795,10 +803,13 @@ public class EVCacheClient {
         if (enableChunking.get()) {
             return assembleChunks(key, false, 0, tc, hasZF);
         } else {
-            final CASValue<T> value = evcacheMemcachedClient.asyncGetAndTouch(key, timeToLive, tc)
-                .get(readTimeout.get(), TimeUnit.MILLISECONDS, _throwException, hasZF);
-            returnVal = (value == null) ? null : value.getValue();
-
+            if(ignoreTouch.get()) {
+                returnVal = evcacheMemcachedClient.get(key, tc);
+            } else {
+                final CASValue<T> value = evcacheMemcachedClient.asyncGetAndTouch(key, timeToLive, tc)
+                        .get(readTimeout.get(), TimeUnit.MILLISECONDS, _throwException, hasZF);
+                returnVal = (value == null) ? null : value.getValue();
+            }
         }
         return returnVal;
     }
@@ -872,8 +883,7 @@ public class EVCacheClient {
         if (!ensureWriteQueueSize(node, key)) {
             if (log.isInfoEnabled()) log.info("Node : " + node + " is not active. Failing fast and dropping the write event.");
             final ListenableFuture<Boolean, OperationCompletionListener> defaultFuture = (ListenableFuture<Boolean, OperationCompletionListener>) getDefaultFuture();
-            if (evcacheLatch != null && evcacheLatch instanceof EVCacheLatchImpl) ((EVCacheLatchImpl) evcacheLatch)
-                    .addFuture(defaultFuture);
+            if (evcacheLatch != null && evcacheLatch instanceof EVCacheLatchImpl && !isInWriteOnly()) ((EVCacheLatchImpl) evcacheLatch).addFuture(defaultFuture);
             return defaultFuture;
         }
 
@@ -916,7 +926,7 @@ public class EVCacheClient {
         if (!ensureWriteQueueSize(node, key)) {
             if (log.isInfoEnabled()) log.info("Node : " + node + " is not active. Failing fast and dropping the write event.");
             final ListenableFuture<Boolean, OperationCompletionListener> defaultFuture = (ListenableFuture<Boolean, OperationCompletionListener>) getDefaultFuture();
-            if (evcacheLatch != null && evcacheLatch instanceof EVCacheLatchImpl) ((EVCacheLatchImpl) evcacheLatch).addFuture(defaultFuture);
+            if (evcacheLatch != null && evcacheLatch instanceof EVCacheLatchImpl && !isInWriteOnly()) ((EVCacheLatchImpl) evcacheLatch).addFuture(defaultFuture);
             return defaultFuture;
         }
 
@@ -935,8 +945,7 @@ public class EVCacheClient {
             if (log.isInfoEnabled()) log.info("Node : " + node
                     + " is not active. Failing fast and dropping the replace event.");
             final ListenableFuture<Boolean, OperationCompletionListener> defaultFuture = (ListenableFuture<Boolean, OperationCompletionListener>) getDefaultFuture();
-            if (evcacheLatch != null && evcacheLatch instanceof EVCacheLatchImpl) ((EVCacheLatchImpl) evcacheLatch)
-                    .addFuture(defaultFuture);
+            if (evcacheLatch != null && evcacheLatch instanceof EVCacheLatchImpl && !isInWriteOnly()) ((EVCacheLatchImpl) evcacheLatch).addFuture(defaultFuture);
             return defaultFuture;
         }
 
@@ -1030,10 +1039,15 @@ public class EVCacheClient {
     }
 
     public <T> Future<Boolean> touch(String key, int timeToLive, EVCacheLatch latch) throws Exception {
+    	if(ignoreTouch.get()) {
+    		final ListenableFuture<Boolean, OperationCompletionListener> sf = new SuccessFuture();
+    		if (latch != null && latch instanceof EVCacheLatchImpl && !isInWriteOnly()) ((EVCacheLatchImpl) latch).addFuture(sf);
+    		return sf;
+    	}
         final MemcachedNode node = evcacheMemcachedClient.getEVCacheNode(key);
         if (!ensureWriteQueueSize(node, key)) {
             final ListenableFuture<Boolean, OperationCompletionListener> defaultFuture = (ListenableFuture<Boolean, OperationCompletionListener>) getDefaultFuture();
-            if (latch != null && latch instanceof EVCacheLatchImpl) ((EVCacheLatchImpl) latch).addFuture(defaultFuture);
+            if (latch != null && latch instanceof EVCacheLatchImpl && !isInWriteOnly()) ((EVCacheLatchImpl) latch).addFuture(defaultFuture);
             return defaultFuture;
         }
 
@@ -1074,7 +1088,7 @@ public class EVCacheClient {
         final MemcachedNode node = evcacheMemcachedClient.getEVCacheNode(key);
         if (!ensureWriteQueueSize(node, key)) {
             final ListenableFuture<Boolean, OperationCompletionListener> defaultFuture = (ListenableFuture<Boolean, OperationCompletionListener>) getDefaultFuture();
-            if (latch != null && latch instanceof EVCacheLatchImpl) ((EVCacheLatchImpl) latch).addFuture(defaultFuture);
+            if (latch != null && latch instanceof EVCacheLatchImpl && !isInWriteOnly()) ((EVCacheLatchImpl) latch).addFuture(defaultFuture);
             return defaultFuture;
         }
 
@@ -1142,6 +1156,10 @@ public class EVCacheClient {
     public boolean isShutdown() {
         return this.shutdown;
     }
+    
+    public boolean isInWriteOnly(){
+        return pool.isInWriteOnly(getServerGroup());
+    }
 
     public Map<SocketAddress, Map<String, String>> getStats(String cmd) {
         if(config.isRendInstance()) {
@@ -1183,6 +1201,45 @@ public class EVCacheClient {
 
     public NodeLocator getNodeLocator() {
         return this.evcacheMemcachedClient.getNodeLocator();
+    }
+    
+    static class SuccessFuture implements ListenableFuture<Boolean, OperationCompletionListener> {
+
+		@Override
+		public boolean cancel(boolean mayInterruptIfRunning) {
+			return true;
+		}
+
+		@Override
+		public boolean isCancelled() {
+			return false;
+		}
+
+		@Override
+		public boolean isDone() {
+			return true;
+		}
+
+		@Override
+		public Boolean get() throws InterruptedException, ExecutionException {
+			return Boolean.TRUE;
+		}
+
+		@Override
+		public Boolean get(long timeout, TimeUnit unit)
+				throws InterruptedException, ExecutionException, TimeoutException {
+			return Boolean.TRUE;
+		}
+
+        @Override
+        public Future<Boolean> addListener(OperationCompletionListener listener) {
+            return this;
+        }
+
+        @Override
+        public Future<Boolean> removeListener(OperationCompletionListener listener) {
+            return this;
+        }		
     }
 
     static class DefaultFuture implements ListenableFuture<Boolean, OperationCompletionListener> {
@@ -1384,5 +1441,31 @@ public class EVCacheClient {
             builder.append("\"}");
             return builder.toString();
         }
+    }
+
+    public int getWriteQueueLength() {
+        final Collection<MemcachedNode> allNodes = evcacheMemcachedClient.getNodeLocator().getAll();
+        int size = 0;
+        for(MemcachedNode node : allNodes) {
+            if(node instanceof EVCacheNodeImpl) {
+                size += ((EVCacheNodeImpl)node).getWriteQueueSize(); 
+            }
+        }
+        return size;
+    }
+
+    public int getReadQueueLength() {
+        final Collection<MemcachedNode> allNodes = evcacheMemcachedClient.getNodeLocator().getAll();
+        int size = 0;
+        for(MemcachedNode node : allNodes) {
+            if(node instanceof EVCacheNodeImpl) {
+                size += ((EVCacheNodeImpl)node).getReadQueueSize(); 
+            }
+        }
+        return size;
+    }
+
+    public TagList getTagList() {
+        return tags;
     }
 }
